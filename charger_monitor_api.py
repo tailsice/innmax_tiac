@@ -1,7 +1,7 @@
 import schedule
 import time
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 from telegram import Bot
 import asyncio
 import requests
@@ -27,24 +27,24 @@ try:
     BEARER_TOKEN = config.get('API_CONFIG', 'AUTHORIZATION_TOKEN')
     TELEGRAM_BOT_TOKEN = config.get('TELEGRAM_CONFIG', 'TELEGRAM_BOT_TOKEN')
     TELEGRAM_CHAT_ID = config.get('TELEGRAM_CONFIG', 'TELEGRAM_CHAT_ID')
-    CSV_FILE = config.get('SYSTEM_CONFIG', 'CSV_FILE')
+    BASE_CSV_NAME = config.get('SYSTEM_CONFIG', 'CSV_FILE')
 except Exception as e:
     print(f"❌ 讀取設定檔發生錯誤: {e}")
     exit()
 
-# --- Request 優化方案: 使用 Session ---
+# --- Request Session 設定 ---
 session = requests.Session()
 session.headers.update({
     'Authorization': f'Bearer {BEARER_TOKEN}',
     'Content-Type': 'application/json',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)'
 })
 
 # --- 全域變數 ---
-last_known_status = {} 
+last_known_status = {} # 格式: {'ID': {'status': '🟢 上線', 'time': datetime}}
 is_first_run = True
-consecutive_failures = 0 
-MAX_FAIL_THRESHOLD = 3 
+consecutive_failures = 0
+MAX_FAIL_THRESHOLD = 3
 
 # 狀態對照表
 STATUS_MAP = {
@@ -59,14 +59,18 @@ STATUS_MAP = {
     'Faulted': '🔧 故障'
 }
 
-# --- 新增：定義需要發送 Telegram 的狀態清單 ---
-# 只有當新狀態是這些時，才會發出通知
-NOTIFY_STATUSES = [STATUS_MAP['Available'], STATUS_MAP['Unavailable']]
-
 # --- 輔助函式 ---
 
 def get_current_gmt8_time():
     return datetime.now(TIMEZONE)
+
+def get_monthly_csv_path():
+    """產生當月檔案路徑，例如：2025-12_charger_log.csv"""
+    now = get_current_gmt8_time()
+    month_prefix = now.strftime("%Y-%m")
+    directory, filename = os.path.split(BASE_CSV_NAME)
+    new_filename = f"{month_prefix}_{filename}"
+    return os.path.join(directory, new_filename)
 
 def escape_markdown_v2(text):
     if text is None: return ""
@@ -83,7 +87,7 @@ def format_duration(start_time, end_time):
     if d > 0: res.append(f"{d}天")
     if h > 0: res.append(f"{h}時")
     res.append(f"{m}分")
-    return "".join(res)
+    return "".join(res) if res else "0分"
 
 async def send_telegram(message):
     try:
@@ -92,7 +96,7 @@ async def send_telegram(message):
     except Exception as e:
         print(f"❌ Telegram 發送失敗: {e}")
 
-# --- API 檢查邏輯 ---
+# --- 核心邏輯 ---
 
 def get_charger_status():
     global consecutive_failures
@@ -112,6 +116,7 @@ def get_charger_status():
         return current_statuses
     except Exception as e:
         consecutive_failures += 1
+        print(f"❌ API 請求失敗 ({consecutive_failures}/{MAX_FAIL_THRESHOLD})")
         if consecutive_failures == MAX_FAIL_THRESHOLD:
             fail_alert = f"⚠️ *系統警報：API 請求持續失敗*\n\n`{escape_markdown_v2(str(e))}`"
             asyncio.run(send_telegram(fail_alert))
@@ -121,10 +126,11 @@ def check_and_report_status():
     global last_known_status, is_first_run
 
     now = get_current_gmt8_time()
-    print(f"[{now.strftime('%H:%M:%S')}] 開始檢查...")
+    current_csv = get_monthly_csv_path()
+    print(f"[{now.strftime('%H:%M:%S')}] 檢查中... (紀錄至: {os.path.basename(current_csv)})")
 
     current_statuses = get_charger_status()
-    if current_statuses is None: return 
+    if current_statuses is None: return
 
     alerts = []
     new_status_memo = {}
@@ -137,15 +143,25 @@ def check_and_report_status():
         if old_status != new_status:
             duration = format_duration(last_time, now)
 
-            # 【邏輯 1】無論是什麼狀態變動，一律寫入 CSV
+            # 1. 寫入 CSV (所有變動都寫入)
             timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
-            df = pd.DataFrame([{'Timestamp': timestamp_str, 'ChargerID': cid, 'OldStatus': old_status, 'NewStatus': new_status, 'Duration': duration}])
-            df.to_csv(CSV_FILE, mode='a', header=not os.path.exists(CSV_FILE), index=False, encoding='utf-8')
+            df = pd.DataFrame([{
+                'Timestamp': timestamp_str, 
+                'ChargerID': cid, 
+                'OldStatus': old_status, 
+                'NewStatus': new_status, 
+                'Duration': duration
+            }])
+            # 使用 utf-8-sig 確保 Excel 開啟中文不亂碼
+            df.to_csv(current_csv, mode='a', header=not os.path.exists(current_csv), index=False, encoding='utf-8-sig')
 
-            # 【邏輯 2】篩選發送 Telegram 的條件
-            # 1. 不是第一次執行 (避免重啟時洗版)
-            # 2. 新狀態必須是「上線」或「離線」
-            if not is_first_run and new_status in NOTIFY_STATUSES:
+            # 2. Telegram 通知過濾邏輯
+            # A. 變更為離線
+            is_to_offline = (new_status == STATUS_MAP['Unavailable'])
+            # B. 從離線恢復為上線
+            is_back_online = (old_status == STATUS_MAP['Unavailable'] and new_status == STATUS_MAP['Available'])
+
+            if not is_first_run and (is_to_offline or is_back_online):
                 msg = (
                     f"🔌 ID: `{escape_markdown_v2(cid)}`\n"
                     f"⏱ 持續: `{escape_markdown_v2(duration)}` 後變動\n"
@@ -162,36 +178,46 @@ def check_and_report_status():
     last_known_status = new_status_memo
 
     if alerts:
-        header = f"📊 *重要狀態變更* \\({escape_markdown_v2(now.strftime('%H:%M'))}\\)\n\n"
+        header = f"📊 *設備狀態重要提醒* \\({escape_markdown_v2(now.strftime('%H:%M'))}\\)\n\n"
         for i in range(0, len(alerts), BATCH_SIZE):
             batch_msg = header + "".join(alerts[i:i+BATCH_SIZE])
             asyncio.run(send_telegram(batch_msg))
             time.sleep(1)
 
     is_first_run = False
-    print("✅ 檢查完成。")
 
 def initialize():
     global last_known_status, is_first_run
     print("--- 系統初始化中 ---")
-    if os.path.exists(CSV_FILE):
+    
+    # 尋找最新的 CSV 檔案來載入狀態 (跨月接續)
+    directory = os.path.dirname(BASE_CSV_NAME) or '.'
+    all_logs = sorted([f for f in os.listdir(directory) if f.endswith(os.path.basename(BASE_CSV_NAME))])
+    
+    if all_logs:
+        latest_csv = os.path.join(directory, all_logs[-1])
         try:
-            df = pd.read_csv(CSV_FILE)
+            df = pd.read_csv(latest_csv)
             if not df.empty:
-                latest = df.sort_values('Timestamp').drop_duplicates(subset=['ChargerID'], keep='last')
-                for _, row in latest.iterrows():
+                latest_rows = df.sort_values('Timestamp').drop_duplicates(subset=['ChargerID'], keep='last')
+                for _, row in latest_rows.iterrows():
                     l_time = datetime.strptime(row['Timestamp'], "%Y-%m-%d %H:%M:%S")
                     last_known_status[str(row['ChargerID'])] = {
                         'status': row['NewStatus'],
                         'time': TIMEZONE.localize(l_time)
                     }
                 is_first_run = False
-        except: pass
+                print(f"ℹ️ 已從 {latest_csv} 載入 {len(last_known_status)} 筆狀態")
+        except Exception as e:
+            print(f"⚠️ 載入舊紀錄失敗: {e}")
+            
     check_and_report_status()
 
 if __name__ == "__main__":
     initialize()
+    # 每 3 分鐘檢查一次
     schedule.every(3).minutes.do(check_and_report_status)
+    
     while True:
         schedule.run_pending()
         time.sleep(1)
