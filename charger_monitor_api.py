@@ -11,8 +11,8 @@ import pytz
 import re
 
 # --- 設定時區常數 ---
-TIMEZONE = pytz.timezone('Asia/Taipei') 
-BATCH_SIZE = 10 
+TIMEZONE = pytz.timezone('Asia/Taipei')
+BATCH_SIZE = 10
 
 # --- 讀取設定檔 ---
 config = configparser.ConfigParser()
@@ -32,32 +32,19 @@ except Exception as e:
     print(f"❌ 讀取設定檔發生錯誤: {e}")
     exit()
 
-# --- 1. Request 優化方案: 使用 Session ---
+# --- Request 優化方案: 使用 Session ---
 session = requests.Session()
 session.headers.update({
-    'Accept': 'application/json',
-    'Accept-Encoding': 'gzip, deflate, br, zstd',
-    'Accept-Language': 'en-US,en;q=0.9',
     'Authorization': f'Bearer {BEARER_TOKEN}',
-    'Connection': 'keep-alive',
     'Content-Type': 'application/json',
-    'Host': 'tyap.ev2.com.tw',
-    'Origin': 'https://tyap.ev2.com.tw',
-    'Referer': 'https://tyap.ev2.com.tw/device/chargingpoint-management',
-    'Sec-Fetch-Dest': 'empty',
-    'Sec-Fetch-Mode': 'cors',
-    'Sec-Fetch-Site': 'same-origin',
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
-    'sec-ch-ua': '"Google Chrome";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"'
 })
 
 # --- 全域變數 ---
-last_known_status = {} # {'ID': {'status': '上線', 'time': datetime}}
-is_first_run = True 
-consecutive_failures = 0 # API 連續失敗計數
-MAX_FAIL_THRESHOLD = 3 # 連續失敗幾次才發報警
+last_known_status = {} 
+is_first_run = True
+consecutive_failures = 0 
+MAX_FAIL_THRESHOLD = 3 
 
 # 狀態對照表
 STATUS_MAP = {
@@ -71,6 +58,10 @@ STATUS_MAP = {
     'Unavailable': '⚫ 離線',
     'Faulted': '🔧 故障'
 }
+
+# --- 新增：定義需要發送 Telegram 的狀態清單 ---
+# 只有當新狀態是這些時，才會發出通知
+NOTIFY_STATUSES = [STATUS_MAP['Available'], STATUS_MAP['Unavailable']]
 
 # --- 輔助函式 ---
 
@@ -109,10 +100,7 @@ def get_charger_status():
     try:
         response = session.get(API_URL, timeout=15)
         response.raise_for_status()
-        
-        # 成功則歸零失敗計數
         consecutive_failures = 0
-        
         data = response.json()
         charger_points = data.get('data', [])
         for cp in charger_points:
@@ -122,26 +110,21 @@ def get_charger_status():
                 if cid and status_raw:
                     current_statuses[cid] = STATUS_MAP.get(status_raw, f"❓ {status_raw}")
         return current_statuses
-
     except Exception as e:
         consecutive_failures += 1
-        error_msg = f"❌ API 請求失敗 ({consecutive_failures}/{MAX_FAIL_THRESHOLD})\n錯誤資訊: {str(e)}"
-        print(error_msg)
-        
-        # 如果連續失敗達到門檻，發送 Telegram 警報
         if consecutive_failures == MAX_FAIL_THRESHOLD:
-            fail_alert = f"⚠️ *系統警報：API 請求持續失敗*\n\n請檢查網路連線或 `AUTHORIZATION_TOKEN` 是否過期。\n\n`{escape_markdown_v2(str(e))}`"
+            fail_alert = f"⚠️ *系統警報：API 請求持續失敗*\n\n`{escape_markdown_v2(str(e))}`"
             asyncio.run(send_telegram(fail_alert))
         return None
 
 def check_and_report_status():
     global last_known_status, is_first_run
-    
+
     now = get_current_gmt8_time()
     print(f"[{now.strftime('%H:%M:%S')}] 開始檢查...")
-    
+
     current_statuses = get_charger_status()
-    if current_statuses is None: return # API 失敗，結束本次排程
+    if current_statuses is None: return 
 
     alerts = []
     new_status_memo = {}
@@ -153,24 +136,25 @@ def check_and_report_status():
 
         if old_status != new_status:
             duration = format_duration(last_time, now)
-            
-            # 寫入 CSV
+
+            # 【邏輯 1】無論是什麼狀態變動，一律寫入 CSV
             timestamp_str = now.strftime("%Y-%m-%d %H:%M:%S")
             df = pd.DataFrame([{'Timestamp': timestamp_str, 'ChargerID': cid, 'OldStatus': old_status, 'NewStatus': new_status, 'Duration': duration}])
             df.to_csv(CSV_FILE, mode='a', header=not os.path.exists(CSV_FILE), index=False, encoding='utf-8')
-            
-            # 準備通知 (啟動後的第一次變動才發送)
-            if not is_first_run:
+
+            # 【邏輯 2】篩選發送 Telegram 的條件
+            # 1. 不是第一次執行 (避免重啟時洗版)
+            # 2. 新狀態必須是「上線」或「離線」
+            if not is_first_run and new_status in NOTIFY_STATUSES:
                 msg = (
                     f"🔌 ID: `{escape_markdown_v2(cid)}`\n"
                     f"⏱ 持續: `{escape_markdown_v2(duration)}` 後變動\n"
-                    f"❌ {escape_markdown_v2(old_status if old_status else 'N/A')}\n"
-                    f"⬇\n"
-                    f"✅ {escape_markdown_v2(new_status)}\n"
+                    f"從 {escape_markdown_v2(old_status if old_status else 'N/A')}\n"
+                    f"變更為 ➔ {escape_markdown_v2(new_status)}\n"
                     "\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\-\\n"
                 )
                 alerts.append(msg)
-            
+
             new_status_memo[cid] = {'status': new_status, 'time': now}
         else:
             new_status_memo[cid] = {'status': new_status, 'time': last_time}
@@ -178,7 +162,7 @@ def check_and_report_status():
     last_known_status = new_status_memo
 
     if alerts:
-        header = f"📊 *狀態變更報告* \\({escape_markdown_v2(now.strftime('%H:%M'))}\\)\n\n"
+        header = f"📊 *重要狀態變更* \\({escape_markdown_v2(now.strftime('%H:%M'))}\\)\n\n"
         for i in range(0, len(alerts), BATCH_SIZE):
             batch_msg = header + "".join(alerts[i:i+BATCH_SIZE])
             asyncio.run(send_telegram(batch_msg))
@@ -198,11 +182,10 @@ def initialize():
                 for _, row in latest.iterrows():
                     l_time = datetime.strptime(row['Timestamp'], "%Y-%m-%d %H:%M:%S")
                     last_known_status[str(row['ChargerID'])] = {
-                        'status': row['NewStatus'], 
+                        'status': row['NewStatus'],
                         'time': TIMEZONE.localize(l_time)
                     }
                 is_first_run = False
-                print(f"ℹ️ 已載入 {len(last_known_status)} 筆歷史紀錄")
         except: pass
     check_and_report_status()
 
